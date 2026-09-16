@@ -7,7 +7,6 @@ type PortResult={port:number;service:string;state:'open'|'closed';protocol:'http
 type DnsAnswer={name:string;type:number;data:string;TTL:number};
 type DnsResponse={Status:number;AD?:boolean;Answer?:DnsAnswer[]};
 
-const ALLOWED_ROOT='alperensenel.com';
 const PORTS=[{port:80,service:'HTTP',protocol:'http'},{port:443,service:'HTTPS',protocol:'https'},{port:3000,service:'Dev server',protocol:'http'},{port:3001,service:'Dev server',protocol:'http'},{port:5000,service:'App server',protocol:'http'},{port:8000,service:'Web server',protocol:'http'},{port:8080,service:'HTTP alternatif',protocol:'http'},{port:8443,service:'HTTPS alternatif',protocol:'https'},{port:8888,service:'Web panel',protocol:'http'}] as const;
 const SENSITIVE=[['/.env','Ortam değişkeni dosyası'],['/.env.local','Yerel ortam dosyası'],['/.git/HEAD','Git depo bilgisi'],['/wp-config.php.bak','WordPress yapılandırma yedeği'],['/config.php.bak','Yapılandırma yedeği'],['/backup.zip','Yedek arşivi'],['/server-status','Sunucu durum sayfası'],['/package.json','Paket manifesti']] as const;
 const json=(data:unknown,status=200)=>Response.json(data,{status,headers:{'Cache-Control':'no-store','Content-Security-Policy':"default-src 'none'; frame-ancestors 'none'",'X-Content-Type-Options':'nosniff'}});
@@ -16,8 +15,20 @@ const finding=(id:string,category:string,title:string,status:Status,severity:Sev
 function normalizeTarget(value:string){
  const clean=value.trim().toLowerCase().replace(/^https?:\/\//,'').split('/')[0].replace(/\.$/,'');
  if(!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(clean))throw new Error('Geçerli bir alan adı gir.');
- if(clean!==ALLOWED_ROOT&&!clean.endsWith(`.${ALLOWED_ROOT}`))throw new Error(`Yalnızca ${ALLOWED_ROOT} ve alt alan adları taranabilir.`);
+ if(clean==='localhost'||clean.endsWith('.localhost')||/\.(?:local|internal|home|lan|test|invalid|example)$/.test(clean))throw new Error('Yerel veya ayrılmış alan adları taranamaz.');
  return clean;
+}
+
+function isPublicIpv4(value:string){
+ const parts=value.split('.').map(Number);if(parts.length!==4||parts.some(n=>!Number.isInteger(n)||n<0||n>255))return false;
+ const[a,b]=parts;
+ return !(a===0||a===10||a===127||a>=224||(a===100&&b>=64&&b<=127)||(a===169&&b===254)||(a===172&&b>=16&&b<=31)||(a===192&&(b===0||b===168))||(a===198&&(b===18||b===19||b===51))||(a===203&&b===0));
+}
+
+function isPublicIpv6(value:string){
+ const ip=value.toLowerCase().split('%')[0];
+ if(ip==='::'||ip==='::1'||ip.startsWith('fc')||ip.startsWith('fd')||/^fe[89ab]/.test(ip)||ip.startsWith('2001:db8:'))return false;
+ const mapped=ip.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);return mapped?isPublicIpv4(mapped[1]):true;
 }
 
 async function fetchTimed(url:string,init:RequestInit={},timeout=5500){
@@ -38,6 +49,13 @@ async function probePort(host:string,item:typeof PORTS[number]):Promise<PortResu
 
 async function dnsQuery(name:string,type:string){
  try{const{response}=await fetchTimed(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,{headers:{Accept:'application/dns-json'}},4500);if(!response.ok)return null;return await response.json<DnsResponse>()}catch{return null}
+}
+
+async function assertPublicTarget(host:string){
+ const[a,aaaa]=await Promise.all([dnsQuery(host,'A'),dnsQuery(host,'AAAA')]);
+ const addresses=[...(a?.Answer||[]),...(aaaa?.Answer||[])].filter(answer=>answer.type===1||answer.type===28).map(answer=>answer.data);
+ if(!addresses.length)throw new Error('Alan adı herkese açık bir IP adresine çözümlenemedi.');
+ if(addresses.some(address=>address.includes(':')?!isPublicIpv6(address):!isPublicIpv4(address)))throw new Error('Özel, yerel veya ayrılmış ağ adresleri taranamaz.');
 }
 
 function headerCheck(headers:Headers,name:string,title:string,category:string,severity:Severity,recommendation:string,validate?:(v:string)=>boolean){
@@ -81,11 +99,11 @@ async function scan(host:string){
 
  try{const random=`webtest-${crypto.randomUUID()}.txt`;const{response}=await fetchTimed(`https://${host}/${random}`,{},3500);const body=await readLimited(response,16384);const verbose=/stack trace|traceback|exception|at\s+[\w$.]+\s*\([^)]*:\d+:\d+\)|sqlstate|fatal error/i.test(body);findings.push(verbose?finding('error-disclosure','Bilgi sızıntısı','Ayrıntılı hata bilgisi sızıyor','danger','high','Rastgele 404 isteği teknik hata ayrıntıları döndürdü.',undefined,'Üretimde ayrıntılı hata ve stack trace gösterimini kapat.'):response.status===200?finding('soft-404','HTTP','Soft 404 davranışı','warning','low','Var olmayan yol HTTP 200 döndürüyor.',`HTTP ${response.status}`,'Var olmayan kaynaklar için gerçek 404 durum kodu döndür.'):finding('error-disclosure','Bilgi sızıntısı','Hata sayfası ayrıntı sızdırmıyor','pass','info',`Var olmayan kaynak HTTP ${response.status} döndürdü.`))}catch{}
 
- const [a,aaaa,cname,txt,mx,dmarc]=await Promise.all([dnsQuery(host,'A'),dnsQuery(host,'AAAA'),dnsQuery(host,'CNAME'),dnsQuery(ALLOWED_ROOT,'TXT'),dnsQuery(ALLOWED_ROOT,'MX'),dnsQuery(`_dmarc.${ALLOWED_ROOT}`,'TXT')]);
+ const [a,aaaa,cname,txt,mx,dmarc]=await Promise.all([dnsQuery(host,'A'),dnsQuery(host,'AAAA'),dnsQuery(host,'CNAME'),dnsQuery(host,'TXT'),dnsQuery(host,'MX'),dnsQuery(`_dmarc.${host}`,'TXT')]);
  const answers=[...(a?.Answer||[]),...(aaaa?.Answer||[]),...(cname?.Answer||[])];findings.push(answers.length?finding('dns-resolution','DNS','DNS kayıtları çözümleniyor','pass','info',`${answers.length} A/AAAA/CNAME cevabı alındı.`,answers.slice(0,6).map(x=>x.data).join(' · ')):finding('dns-resolution','DNS','DNS çözümlemesi başarısız','danger','high','A, AAAA veya CNAME cevabı alınamadı.',undefined,'Yetkili DNS kayıtlarını kontrol et.'));
  findings.push(a?.AD||aaaa?.AD||cname?.AD?finding('dnssec','DNS','DNSSEC doğrulaması etkin','pass','info','DNS yanıtı doğrulanmış veri işareti taşıyor.'):finding('dnssec','DNS','DNSSEC doğrulaması görünmüyor','warning','medium','DNS yanıtlarında AD işareti gözlenmedi.',undefined,'Alan adı sağlayıcında DNSSEC’i etkinleştir ve DS kaydını doğrula.'));
  const spf=(txt?.Answer||[]).some(x=>/v=spf1/i.test(x.data));const hasMx=(mx?.Answer||[]).length>0;findings.push(!hasMx?finding('spf','E-posta','E-posta servisi tanımlı değil','info','info','MX kaydı bulunmadı; alan adı e-posta göndermiyorsa bu normaldir.'):spf?finding('spf','E-posta','SPF kaydı mevcut','pass','info','Alan adında SPF politikası bulundu.'):finding('spf','E-posta','SPF kaydı eksik','warning','medium','MX kaydı var ancak SPF politikası bulunamadı.',undefined,'Yetkili e-posta gönderenlerini tanımlayan SPF TXT kaydı ekle.'));
- const dmarcValue=(dmarc?.Answer||[]).find(x=>/v=dmarc1/i.test(x.data))?.data;findings.push(!hasMx?finding('dmarc','E-posta','DMARC gerekli olmayabilir','info','info','MX kaydı olmadığı için e-posta sahteciliği kapsamı sınırlı.'):dmarcValue?finding('dmarc','E-posta','DMARC politikası mevcut','pass','info','DMARC kaydı bulundu.',dmarcValue):finding('dmarc','E-posta','DMARC kaydı eksik','warning','high','E-posta alanı için DMARC politikası bulunamadı.',undefined,`_dmarc.${ALLOWED_ROOT} altında DMARC TXT kaydı ekle.`));
+ const dmarcValue=(dmarc?.Answer||[]).find(x=>/v=dmarc1/i.test(x.data))?.data;findings.push(!hasMx?finding('dmarc','E-posta','DMARC gerekli olmayabilir','info','info','MX kaydı olmadığı için e-posta sahteciliği kapsamı sınırlı.'):dmarcValue?finding('dmarc','E-posta','DMARC politikası mevcut','pass','info','DMARC kaydı bulundu.',dmarcValue):finding('dmarc','E-posta','DMARC kaydı eksik','warning','high','E-posta alanı için DMARC politikası bulunamadı.',undefined,`_dmarc.${host} altında DMARC TXT kaydı ekle.`));
 
  const weight:Record<Severity,number>={critical:25,high:14,medium:8,low:3,info:0};const penalty=findings.filter(f=>f.status==='danger'||f.status==='warning').reduce((n,f)=>n+weight[f.severity],0);const score=Math.max(0,100-penalty);
  const counts={critical:findings.filter(f=>f.severity==='critical'&&f.status==='danger').length,high:findings.filter(f=>f.severity==='high'&&(f.status==='danger'||f.status==='warning')).length,medium:findings.filter(f=>f.severity==='medium'&&(f.status==='danger'||f.status==='warning')).length,low:findings.filter(f=>f.severity==='low'&&(f.status==='danger'||f.status==='warning')).length,passed:findings.filter(f=>f.status==='pass').length};
@@ -93,7 +111,7 @@ async function scan(host:string){
 }
 
 export async function POST(request:Request){
- try{const length=Number(request.headers.get('content-length')||0);if(length>2048)return json({error:'İstek çok büyük.'},413);const raw=await request.text();if(raw.length>2048)return json({error:'İstek çok büyük.'},413);const body:unknown=JSON.parse(raw);if(!body||typeof body!=='object'||!('target'in body)||typeof body.target!=='string')return json({error:'Hedef alan adı gerekli.'},400);const host=normalizeTarget(body.target);return json(await scan(host))}catch(error){const message=error instanceof Error?error.message:'Tarama tamamlanamadı.';console.error(JSON.stringify({message:'scan_failed',error:message}));return json({error:message},message.includes('Yalnızca')||message.includes('Geçerli')?400:500)}
+ try{const length=Number(request.headers.get('content-length')||0);if(length>2048)return json({error:'İstek çok büyük.'},413);const raw=await request.text();if(raw.length>2048)return json({error:'İstek çok büyük.'},413);const body:unknown=JSON.parse(raw);if(!body||typeof body!=='object'||!('target'in body)||typeof body.target!=='string')return json({error:'Hedef alan adı gerekli.'},400);if(!('authorized'in body)||body.authorized!==true)return json({error:'Bu alan adını test etmeye yetkili olduğunu onaylamalısın.'},400);const host=normalizeTarget(body.target);await assertPublicTarget(host);return json(await scan(host))}catch(error){const message=error instanceof Error?error.message:'Tarama tamamlanamadı.';console.error(JSON.stringify({message:'scan_failed',error:message}));const invalid=/^(Geçerli|Yerel|Alan adı|Özel)/.test(message);return json({error:message},invalid?400:500)}
 }
 
-export function GET(){return json({service:'WebTest Security Scanner',scope:[ALLOWED_ROOT,`*.${ALLOWED_ROOT}`],mode:'passive-authorized-only'})}
+export function GET(){return json({service:'WebTest Security Scanner',scope:'public-hostnames',blocked:'private-and-reserved-networks',mode:'passive-authorized-only'})}
